@@ -1,0 +1,121 @@
+---
+
+- hosts: localhost
+  vars:
+    ec2_instances_flat: []
+
+  tasks:
+    - name: Get my current IP address
+      uri:
+        url: http://checkip.amazonaws.com/
+        return_content: yes
+      register: my_ip
+
+    - name: Create simple security group
+      ec2_group:
+        name: webservers
+        description: A security group for my current IP
+        region: eu-west-1
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: "{{ my_ip.content | replace('\n', '') }}/32"
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: "{{ my_ip.content | replace('\n', '') }}/32"
+        rules_egress:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+      register: webservers_group
+
+    - name: Create the ELB only listening over port 80
+      ec2_elb_lb:
+        name: "{{ application }}-load-balancer"
+        state: present
+        region: eu-west-1
+        zones:
+          - eu-west-1a
+          - eu-west-1b
+        listeners:
+          - protocol: http
+            load_balancer_port: 80
+            instance_port: 80
+      register: elb
+
+    - name: Create EC2 instances
+      ec2:
+        key_name: "{{ key_pair }}"
+        instance_type: t2.micro
+        image: ami-0943382e114f188e8
+        region: eu-west-1
+        zone: "{{ item.key }}"
+        group_id:
+          - "{{ webservers_group.group_id }}"
+          - "{{ elb.elb.security_group_ids | first }}"
+        wait: yes
+        instance_tags:
+          application: "{{ application }}"
+        exact_count: "{{ item.value.instance_count }}"
+        count_tag:
+          application: "{{ application }}"
+      with_dict: "{{ availability_zones }}"
+      register: ec2_instances
+    
+    - name: Build a list of all tagged_instances.
+      set_fact:
+        ec2_instances_flat: "{{ ec2_instances_flat + item.tagged_instances }}"
+      with_items: "{{ ec2_instances.results }}"
+
+    - name: Store EC2 instance IPs to provision against
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groupname: ec2_instance_ips
+      with_items: "{{ ec2_instances_flat }}"
+
+    - name: Wait for servers to come online
+      wait_for:
+        host: "{{ item.public_ip }}"
+        port: 22
+        timeout: 180
+      with_items: "{{ ec2_instances_flat }}"
+
+    - name: Add EC2 instances as known hosts
+      known_hosts:
+        name: "{{ item.public_ip }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t rsa ' + item.public_ip) }}"
+      with_items: "{{ ec2_instances_flat }}"
+
+
+- hosts: ec2_instance_ips
+  remote_user: ubuntu
+  become: True
+  tasks:
+    - name: Update apt-get repo and cache
+      apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+    - name: Create default index page
+      copy:
+        dest: /var/www/html/index.html
+        content: "Howdy from {{ ansible_hostname }}"
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+
+- hosts: localhost
+  tasks:
+    - name: Add each EC2 instance to the ELB
+      ec2_elb:
+        state: present
+        ec2_elbs: "{{ application }}-load-balancer"
+        region: "{{ item.region }}"
+        instance_id: "{{ item.id }}"
+      with_items: "{{ ec2_instances_flat }}"
