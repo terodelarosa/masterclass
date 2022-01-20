@@ -1,0 +1,9 @@
+---
+application: masterclass-lb
+instance_count: 2
+key_pair: tero
+availability_zones:
+  eu-west-1a:
+    instance_count: 1
+  eu-west-1b:
+    instance_count: 1
